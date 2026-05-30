@@ -1,0 +1,209 @@
+# ==============================================================================
+# CONFIGURATION GUIDE
+# ==============================================================================
+# For this workflow to function correctly, you need to configure a GitHub Personal
+# Access Token (PAT) with appropriate repository permissions:
+#
+# Navigate to: Settings -> Secrets and variables -> Actions
+# 
+# In the "Secrets" tab, add:
+#    - SYNC_PAT: A GitHub Personal Access Token (Classic or Fine-grained) with
+#                permissions to create/update repositories, push code, and trigger workflows.
+#                (Scopes needed: 'repo' and 'workflow')
+# ==============================================================================
+
+name: Initial Setup - Bulk Create Repositories
+on:
+  workflow_dispatch:
+    inputs:
+      prefix:
+        description: 'Prefix for new repositories'
+        default: 'doh-node'
+        required: true
+      count:
+        description: 'Number of repositories to create'
+        default: '100'
+        required: true
+      visibility:
+        description: 'Repository visibility'
+        type: choice
+        default: 'private'
+        options:
+          - public
+          - private
+        required: true
+
+concurrency:
+  group: git-operations
+  cancel-in-progress: false
+
+jobs:
+  create-repos:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@main
+
+      - name: Setup Node.js
+        uses: actions/setup-node@main
+        with:
+          node-version: '24'
+
+      - name: Bulk Create & Track Repositories
+        uses: actions/github-script@main
+        with:
+          github-token: ${{ secrets.SYNC_PAT }}
+          script: |
+            const fs = require('fs');
+            const prefix = context.payload.inputs.prefix;
+            const count = parseInt(context.payload.inputs.count);
+            const isPrivate = context.payload.inputs.visibility === 'private';
+            
+            // === RATE LIMITING CONFIGURATION ===
+            // Delays in milliseconds (1000ms = 1 second)
+            const DELAY_AFTER_CREATE = 2000;        // Delay after creating a new repo
+            const DELAY_AFTER_UPDATE = 1000;        // Delay after updating visibility
+            const DELAY_ON_ERROR = 5000;            // Delay when an error occurs
+            const DELAY_BETWEEN_EXISTING = 0;       // Delay when repo already exists (no change needed)
+            // ===================================
+            
+            const user = await github.rest.users.getAuthenticated();
+            const owner = user.data.login;
+            console.log(`Target account: ${owner}`);
+
+            // 1. Fetch ALL existing repos for this user to avoid redundant creation calls
+            console.log("Fetching existing repositories list...");
+            const existingRepos = await github.paginate(github.rest.repos.listForAuthenticatedUser, {
+              visibility: 'all',
+              affiliation: 'owner'
+            });
+            const existingNames = new Set(existingRepos.map(r => r.name.toLowerCase()));
+            const existingRepoMap = new Map(existingRepos.map(r => [r.name.toLowerCase(), r]));
+            // Calculate digits needed based on count (e.g., count=1000 -> 4 digits, count=100 -> 3 digits)
+            const digitCount = Math.max(3, String(count).length);
+            // Escape regex special characters in prefix
+            const escapedPrefix = prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            const patternRegex = new RegExp(`^${escapedPrefix}-\\d{${digitCount}}$`, 'i');
+            const matchingRepos = existingRepos.filter(r => patternRegex.test(r.name));
+            const needToCreate = Math.max(0, count - matchingRepos.length);
+            console.log(`Target: ${count} repositories (${digitCount} digits) | Found ${matchingRepos.length} existing | Need to create: ${needToCreate}`);
+
+            // 2. Load nodes.json - support both old format (array of strings) and new format (array of objects)
+            let nodes = [];
+            if (fs.existsSync('database/nodes.json')) {
+              const rawData = JSON.parse(fs.readFileSync('database/nodes.json', 'utf8'));
+              if (Array.isArray(rawData)) {
+                // Convert old format to new format
+                nodes = rawData.map(item => {
+                  if (typeof item === 'string') {
+                    return { name: item, private: null }; // null = unknown, will be checked
+                  }
+                  return item;
+                });
+              }
+            }
+            const nodesMap = new Map(nodes.map(n => [n.name.toLowerCase(), n]));
+
+            let created = 0;
+            let existed = 0;
+            let failed = 0;
+            let visibilityUpdated = 0;
+
+            for (let i = 1; i <= count; i++) {
+              const repoName = `${prefix}-${String(i).padStart(digitCount, '0')}`;
+              const fullName = `${owner}/${repoName}`;
+              process.stdout.write(`Processing [${i}/${count}]: ${repoName}... `);
+
+              // CHECK BEFORE CALLING API
+              if (existingNames.has(repoName.toLowerCase())) {
+                const existingRepo = existingRepoMap.get(repoName.toLowerCase());
+                const currentPrivate = existingRepo.private;
+                const savedNode = nodesMap.get(fullName.toLowerCase());
+                
+                // Check if visibility needs to be updated
+                if (currentPrivate !== isPrivate) {
+                  try {
+                    await github.request('PATCH /repos/{owner}/{repo}', {
+                      owner: owner,
+                      repo: repoName,
+                      private: isPrivate,
+                      headers: {
+                        'Accept': 'application/vnd.github+json',
+                        'X-GitHub-Api-Version': '2022-11-28'
+                      }
+                    });
+                    console.log(`EXISTS (Visibility updated: ${currentPrivate ? 'private→public' : 'public→private'})`);
+                    visibilityUpdated++;
+                    await new Promise(r => setTimeout(r, DELAY_AFTER_UPDATE));
+                  } catch (error) {
+                    console.log(`EXISTS (Visibility update failed: ${error.message})`);
+                    failed++;
+                    await new Promise(r => setTimeout(r, DELAY_ON_ERROR));
+                  }
+                } else {
+                  // Only log if visibility changed from saved state or not in saved state
+                  if (!savedNode || savedNode.private !== currentPrivate) {
+                    console.log("EXISTS (Visibility OK, updated in DB)");
+                  } else {
+                    console.log("EXISTS (Visibility OK)");
+                  }
+                }
+                existed++;
+                
+                // Update or add to nodes map
+                nodesMap.set(fullName.toLowerCase(), { name: fullName, private: isPrivate });
+                if (DELAY_BETWEEN_EXISTING > 0) {
+                  await new Promise(r => setTimeout(r, DELAY_BETWEEN_EXISTING));
+                }
+                continue;
+              }
+
+              try {
+                // 3. Create Repository (Only if not exists)
+                await github.request('POST /user/repos', {
+                  name: repoName,
+                  private: isPrivate,
+                  description: `Node ${i} for DNS Gateway`,
+                  headers: {
+                    'Accept': 'application/vnd.github+json',
+                    'X-GitHub-Api-Version': '2022-11-28'
+                  }
+                });
+                console.log("CREATED");
+                created++;
+                nodesMap.set(fullName.toLowerCase(), { name: fullName, private: isPrivate });
+                await new Promise(r => setTimeout(r, DELAY_AFTER_CREATE)); 
+              } catch (error) {
+                console.log(`FAILED (${error.message})`);
+                failed++;
+                await new Promise(r => setTimeout(r, DELAY_ON_ERROR));
+              }
+            }
+
+            // 4. Save nodes list
+            if (!fs.existsSync('database')) fs.mkdirSync('database');
+            const finalNodes = [...nodesMap.values()].sort((a, b) => a.name.localeCompare(b.name));
+            fs.writeFileSync('database/nodes.json', JSON.stringify(finalNodes, null, 2));
+
+            console.log("\n=======================================");
+            console.log(" BULK CREATE SUMMARY:");
+            console.log(` - Total Requested:  ${count}`);
+            console.log(` - New Created:      ${created}`);
+            console.log(` - Already Existed:  ${existed}`);
+            console.log(` - Visibility Updated: ${visibilityUpdated}`);
+            console.log(` - Failed:           ${failed}`);
+            console.log(` - Total in File:    ${finalNodes.length}`);
+            console.log("=======================================");
+
+      - name: Commit and Push nodes.json
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add database/nodes.json
+          if git diff --staged --quiet; then
+            echo "No changes in nodes.json"
+          else
+            git commit -m "Update nodes.json with newly created/confirmed nodes"
+            git pull --rebase origin main
+            git push
+          fi
